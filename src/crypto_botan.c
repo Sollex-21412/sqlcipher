@@ -44,6 +44,10 @@ typedef struct botan_cipher_struct* botan_cipher_t;
 
 const char* botan_version_string(void);
 
+int botan_rng_init(botan_rng_t* rng, const char* rng_type);
+int botan_rng_get(botan_rng_t rng, uint8_t* out, size_t out_len);
+int botan_rng_destroy(botan_rng_t rng);
+
 int botan_pwdhash(
    const char* algo,
    size_t param1,
@@ -67,6 +71,13 @@ int botan_cipher_update(botan_cipher_t cipher,
                                   const uint8_t input_bytes[],
                                   size_t input_size,
                                   size_t* input_consumed);
+int botan_cipher_get_keyspec(botan_cipher_t,
+                                                   size_t* min_keylen,
+                                                   size_t* max_keylen,
+                                                   size_t* mod_keylen);
+int botan_cipher_get_default_nonce_length(botan_cipher_t cipher, size_t* nl);
+int botan_cipher_get_update_granularity(botan_cipher_t cipher, size_t* ug);
+int botan_cipher_clear(botan_cipher_t cipher);
 int botan_cipher_destroy(botan_cipher_t cipher);
 
 int botan_mac_init(botan_mac_t* mac, const char* mac_name, uint32_t flags);
@@ -82,6 +93,12 @@ int botan_mac_destroy(botan_mac_t mac);
 #define BOTAN_CIPHER_UPDATE_FLAG_FINAL (1U << 0)
 
 #define BOTAN_FFI_SUCCESS 0
+
+typedef struct {
+  botan_rng_t rng;
+  botan_cipher_t cipher_enc;
+  botan_cipher_t cipher_dec;
+} botan_ctx;
 
 static unsigned int botan_init_count = 0;
 
@@ -105,6 +122,22 @@ static int sqlcipher_botan_deactivate(void *ctx) {
 
   botan_init_count--;
 
+  if (botan_init_count == 0) {
+    botan_ctx *b_ctx = (botan_ctx *)ctx;
+    if (b_ctx->rng) {
+      botan_rng_destroy(b_ctx->rng);
+      b_ctx->rng = NULL;
+    }
+    if (b_ctx->cipher_dec) {
+      botan_cipher_destroy(b_ctx->cipher_dec);
+      b_ctx->cipher_dec = NULL;
+    }
+    if (b_ctx->cipher_enc) {
+      botan_cipher_destroy(b_ctx->cipher_enc);
+      b_ctx->cipher_enc = NULL;
+    }
+  }
+
   CODEC_TRACE_MUTEX("sqlcipher_botan_deactivate: leaving SQLCIPHER_MUTEX_PROVIDER_ACTIVATE\n");
   sqlite3_mutex_leave(sqlcipher_mutex(SQLCIPHER_MUTEX_PROVIDER_ACTIVATE));
   CODEC_TRACE_MUTEX("sqlcipher_botan_deactivate: left SQLCIPHER_MUTEX_PROVIDER_ACTIVATE\n");
@@ -117,22 +150,7 @@ static int sqlcipher_botan_add_random(void *ctx, void *buffer, int length) {
 
 /* generate a defined number of random bytes */
 static int sqlcipher_botan_random (void *ctx, void *buffer, int length) {
-  int rc = SQLITE_OK;
-  botan_rng_t rng = NULL;
-  if (botan_rng_init(&rng, "system") != BOTAN_FFI_SUCCESS) {
-    goto error;
-  }
-
-  if (botan_rng_get(rng, buffer, length) != BOTAN_FFI_SUCCESS) {
-    goto error;
-  }
-
-  goto cleanup;
-  error:
-    rc = SQLITE_ERROR;
-  cleanup:
-    if (rng) botan_rng_destroy(rng);
-    return rc;
+  return botan_rng_get(((botan_ctx *)ctx)->rng, buffer, length) == BOTAN_FFI_SUCCESS ? SQLITE_OK : SQLITE_ERROR;
 }
 
 static const char* sqlcipher_botan_get_provider_name(void *ctx) {
@@ -148,63 +166,18 @@ static const char* sqlcipher_botan_get_cipher(void *ctx) {
 }
 
 static int sqlcipher_botan_get_key_sz(void *ctx) {
-  botan_cipher_t cipher = NULL;
-
-  if (botan_cipher_init(&cipher, sqlcipher_botan_get_cipher(ctx), BOTAN_CIPHER_INIT_FLAG_ENCRYPT) != BOTAN_FFI_SUCCESS) {
-    goto error;
-  }
-
   size_t min_keylen = 0;
-  if (botan_cipher_get_keyspec(cipher, &min_keylen, NULL, NULL) != BOTAN_FFI_SUCCESS) {
-    goto error;
-  }
-
-  goto cleanup;
-  error:
-    min_keylen = SQLITE_ERROR;
-  cleanup:
-    if (cipher) botan_cipher_destroy(cipher);
-    return min_keylen;
+  return botan_cipher_get_keyspec(((botan_ctx *)ctx)->cipher_enc, &min_keylen, NULL, NULL) == BOTAN_FFI_SUCCESS ? min_keylen : SQLITE_ERROR;
 }
 
 static int sqlcipher_botan_get_iv_sz(void *ctx) {
-  botan_cipher_t cipher = NULL;
-
-  if (botan_cipher_init(&cipher, sqlcipher_botan_get_cipher(ctx), BOTAN_CIPHER_INIT_FLAG_ENCRYPT) != BOTAN_FFI_SUCCESS) {
-    goto error;
-  }
-
   size_t nl = 0;
-  if (botan_cipher_get_default_nonce_length(cipher, &nl) != BOTAN_FFI_SUCCESS) {
-    goto error;
-  }
-
-  goto cleanup;
-  error:
-    nl = SQLITE_ERROR;
-  cleanup:
-    if (cipher) botan_cipher_destroy(cipher);
-    return nl;
+  return botan_cipher_get_default_nonce_length(((botan_ctx *)ctx)->cipher_enc, &nl) == BOTAN_FFI_SUCCESS ? nl : SQLITE_ERROR;
 }
 
 static int sqlcipher_botan_get_block_sz(void *ctx) {
-  botan_cipher_t cipher = NULL;
-
-  if (botan_cipher_init(&cipher, sqlcipher_botan_get_cipher(ctx), BOTAN_CIPHER_INIT_FLAG_ENCRYPT) != BOTAN_FFI_SUCCESS) {
-    goto error;
-  }
-
   size_t ug = 0;
-  if (botan_cipher_get_update_granularity(cipher, &ug) != BOTAN_FFI_SUCCESS) {
-    goto error;
-  }
-
-  goto cleanup;
-  error:
-    ug = SQLITE_ERROR;
-  cleanup:
-    if (cipher) botan_cipher_destroy(cipher);
-    return ug;
+  return botan_cipher_get_update_granularity(((botan_ctx *)ctx)->cipher_enc, &ug) == BOTAN_FFI_SUCCESS ? ug : SQLITE_ERROR;
 }
 
 static int sqlcipher_botan_get_hmac_sz(void *ctx, int algorithm) {
@@ -294,7 +267,6 @@ static int sqlcipher_botan_hmac(void *ctx, int algorithm, unsigned char *hmac_ke
 }
 
 static int sqlcipher_botan_kdf(void *ctx, int algorithm, const unsigned char *pass, int pass_sz, unsigned char* salt, int salt_sz, int workfactor, int key_sz, unsigned char *key) {
-  int rc = SQLITE_OK;
   char *algo = NULL;
   switch(algorithm) {
     case SQLCIPHER_HMAC_SHA1:
@@ -307,27 +279,15 @@ static int sqlcipher_botan_kdf(void *ctx, int algorithm, const unsigned char *pa
       algo = "PBKDF2(SHA-512)";
       break;
     default:
-      goto error;
+      return SQLITE_ERROR;
   }
 
-  if (botan_pwdhash(algo, workfactor, 0, 0, key, key_sz, pass, pass_sz, salt, salt_sz) != BOTAN_FFI_SUCCESS) {
-    goto error;
-  }
-
-  goto cleanup;
-  error:
-    rc = SQLITE_ERROR;
-  cleanup:
-    return rc;
+  return botan_pwdhash(algo, workfactor, 0, 0, key, key_sz, pass, pass_sz, salt, salt_sz) == BOTAN_FFI_SUCCESS ? SQLITE_OK : SQLITE_ERROR;
 }
 
 static int sqlcipher_botan_cipher(void *ctx, int mode, unsigned char *key, int key_sz, unsigned char *iv, unsigned char *in, int in_sz, unsigned char *out) {
   int rc = SQLITE_OK;
-  botan_cipher_t cipher = NULL;
-
-  if (botan_cipher_init(&cipher, sqlcipher_botan_get_cipher(ctx), mode == CIPHER_ENCRYPT ? BOTAN_CIPHER_INIT_FLAG_ENCRYPT : BOTAN_CIPHER_INIT_FLAG_DECRYPT) != BOTAN_FFI_SUCCESS) {
-    goto error;
-  }
+  botan_cipher_t cipher = mode == CIPHER_ENCRYPT ? ((botan_ctx *)ctx)->cipher_enc : ((botan_ctx *)ctx)->cipher_dec;
 
   if (botan_cipher_set_key(cipher, key, key_sz) != BOTAN_FFI_SUCCESS) {
     goto error;
@@ -339,7 +299,6 @@ static int sqlcipher_botan_cipher(void *ctx, int mode, unsigned char *key, int k
 
   size_t output_written = 0;
   size_t input_consumed = 0;
-
   if (botan_cipher_update(cipher, BOTAN_CIPHER_UPDATE_FLAG_FINAL, out, in_sz + 16, &output_written, in, in_sz, &input_consumed) != BOTAN_FFI_SUCCESS) {
     goto error;
   }
@@ -348,17 +307,52 @@ static int sqlcipher_botan_cipher(void *ctx, int mode, unsigned char *key, int k
   error:
     rc = SQLITE_ERROR;
   cleanup:
-    if (cipher) botan_cipher_destroy(cipher);
+    if (cipher) botan_cipher_clear(cipher);
     return rc;
 }
 
 static int sqlcipher_botan_ctx_init(void **ctx) {
-  sqlcipher_botan_activate(NULL);
-  return SQLITE_OK;
+  int rc = SQLITE_OK;
+  botan_ctx *b_ctx = NULL;
+
+  *ctx = sqlcipher_malloc(sizeof(botan_ctx));
+  if(*ctx == NULL) return SQLITE_NOMEM;
+  sqlcipher_memset(*ctx, 0, sizeof(botan_ctx));
+  sqlcipher_botan_activate(*ctx);
+  
+  b_ctx = (botan_ctx *)*ctx;
+  if (botan_rng_init(&(b_ctx->rng), "system") != BOTAN_FFI_SUCCESS) {
+    goto error;
+  }
+  if (botan_cipher_init(&(b_ctx->cipher_enc), sqlcipher_botan_get_cipher(ctx), BOTAN_CIPHER_INIT_FLAG_ENCRYPT) != BOTAN_FFI_SUCCESS) {
+    goto error;
+  }
+  if (botan_cipher_init(&(b_ctx->cipher_dec), sqlcipher_botan_get_cipher(ctx), BOTAN_CIPHER_INIT_FLAG_DECRYPT) != BOTAN_FFI_SUCCESS) {
+    goto error;
+  }
+
+  goto cleanup;
+  error:
+    rc = SQLITE_ERROR;
+    if (b_ctx->rng) {
+      botan_rng_destroy(b_ctx->rng);
+      b_ctx->rng = NULL;
+    }
+    if (b_ctx->cipher_dec) {
+      botan_cipher_destroy(b_ctx->cipher_dec);
+      b_ctx->cipher_dec = NULL;
+    }
+    if (b_ctx->cipher_enc) {
+      botan_cipher_destroy(b_ctx->cipher_enc);
+      b_ctx->cipher_enc = NULL;
+    }
+  cleanup:
+    return rc;
 }
 
 static int sqlcipher_botan_ctx_free(void **ctx) {
-  sqlcipher_botan_deactivate(NULL);
+  sqlcipher_botan_deactivate(*ctx);
+  sqlcipher_free(*ctx, sizeof(botan_ctx));
   return SQLITE_OK;
 }
 
